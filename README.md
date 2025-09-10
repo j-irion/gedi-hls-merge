@@ -108,7 +108,7 @@ python gedi_hls_join.py --aoi-wkt "POLYGON((-150 64,-150 65,-148 65,-148 64,-150
 
 ---
 
-## Setting the “location of the analysis”
+## Setting the working directory
 
 Use `--workdir` to control **where caches and outputs go**. Example:
 ```bash
