@@ -25,17 +25,87 @@ from urllib3.util.retry import Retry
 from dateutil.relativedelta import relativedelta  # you already have this
 from urllib.parse import urlparse
 
-# ---------------- USER SETTINGS ----------------
-AOI_BBOX = (-97.5, 46.5, -90.0, 49.5)      # lon_min, lat_min, lon_max, lat_max
-YEAR = 2022
-MONTHS = [7] # list(range(1, 13))                # try [7] first
-ROLLING_DAYS = 7                            # +/- days around each month for HLS median
-MAX_HLS_ITEMS_PER_MONTH = 200               # cap per month (L30+S30 combined)
-OUT_CSV = "./gedi_hls_monthly_30m.csv"
-GEDI_L4A_COLLECTION_ID = "C2237824918-ORNL_CLOUD"
-FMASK_CLEAR_VALUES = {0}                    # keep clear pixels only
-SHORT_NAME = "GEDI_L4A_AGB_Density_V2_1"
-# ------------------------------------------------
+import argparse
+import json
+from shapely.geometry import shape
+from shapely import wkt as shapely_wkt
+
+# ---------------- CLI / CONFIG ----------------
+def _parse_months(mstr: str) -> list[int]:
+    mstr = (mstr or "").strip().lower()
+    if mstr in ("all", "1-12"):
+        return list(range(1, 13))
+    if not mstr:
+        return [7]  # sensible default
+    return [int(x) for x in mstr.split(",") if x.strip()]
+
+def _resolve_aoi_bbox(args) -> tuple[float,float,float,float]:
+    # Priority: --aoi-bbox > --aoi-geojson > --aoi-wkt > default
+    if args.aoi_bbox:
+        parts = [float(x) for x in args.aoi_bbox.split(",")]
+        if len(parts) != 4:
+            raise ValueError("--aoi-bbox needs 4 comma-separated numbers: minLon,minLat,maxLon,maxLat")
+        return tuple(parts)  # type: ignore[return-value]
+
+    if args.aoi_geojson:
+        with open(args.aoi_geojson, "r") as f:
+            gj = json.load(f)
+        if gj.get("type") == "FeatureCollection":
+            geom = shape(gj["features"][0]["geometry"])
+        elif gj.get("type") == "Feature":
+            geom = shape(gj["geometry"])
+        else:
+            geom = shape(gj)  # bare geometry dict
+        minx, miny, maxx, maxy = geom.bounds
+        return (float(minx), float(miny), float(maxx), float(maxy))
+
+    if args.aoi_wkt:
+        geom = shapely_wkt.loads(args.aoi_wkt)
+        minx, miny, maxx, maxy = geom.bounds
+        return (float(minx), float(miny), float(maxx), float(maxy))
+
+    # Default AOI (your current one)
+    return (-97.5, 46.5, -90.0, 49.5)
+
+def parse_cli():
+    p = argparse.ArgumentParser(
+        description="Join GEDI L4A to HLS (L30+S30) at GEDI shot locations and export CSV."
+    )
+    # AOI
+    p.add_argument("--aoi-bbox", type=str, help="minLon,minLat,maxLon,maxLat")
+    p.add_argument("--aoi-geojson", type=str, help="Path to GeoJSON (Feature/FeatureCollection/Geometry)")
+    p.add_argument("--aoi-wkt", type=str, help="WKT geometry string")
+
+    # Time selection
+    p.add_argument("--year", type=int, default=2022, help="Target year (used with --months)")
+    p.add_argument("--months", type=str, default="7",
+                   help="Comma-separated months (e.g. '6,7,8') or 'all'")
+
+    # Rolling window & limits
+    p.add_argument("--rolling-days", type=int, default=7,
+                   help="+/- days around each month for HLS median")
+    p.add_argument("--max-hls-per-month", type=int, default=200,
+                   help="Max HLS granules (L30+S30 combined) per month")
+    p.add_argument("--limit-gedi-per-month", type=int, default=40,
+                   help="Limit GEDI granules per month (None to read all)")
+
+    # Output & workspace
+    p.add_argument("--workdir", type=str, default=".",
+                   help="Folder where caches & outputs are stored")
+    p.add_argument("--out-csv", type=str, default="gedi_hls_monthly_30m.csv",
+                   help="Output CSV (relative to --workdir if not absolute)")
+
+    # Product/quality options
+    p.add_argument("--gedi-collection-id", default="C2237824918-ORNL_CLOUD")
+    p.add_argument("--accept-water", action="store_true",
+                   help="Keep water pixels flagged as clear water")
+    p.add_argument("--accept-adjacent", action="store_true",
+                   help="Keep pixels adjacent to cloud/shadow")
+    p.add_argument("--accept-snow", action="store_true",
+                   help="Keep snow/ice pixels")
+
+    return p.parse_args()
+
 
 # -------------- Helpers --------------
 def looks_like_netcdf(buf: bytes) -> bool:
@@ -689,17 +759,42 @@ def hls_v2_clear_mask(qa_array: np.ndarray,
 
 
 # ---------------- Main ----------------
-def main():
+def main(args):
     # --- Auth ---
     earthaccess.login(strategy="netrc")
 
-    # --- Settings / caches ---
-    gedi_cache = "./gedi_cache"
-    hls_cache  = "./hls_cache_hlss30_v2"
+    # --- Resolve config from CLI ---
+    AOI_BBOX = _resolve_aoi_bbox(args)
+    YEAR = args.year
+    MONTHS = _parse_months(args.months)
+    ROLLING_DAYS = args.rolling_days
+    MAX_HLS_ITEMS_PER_MONTH = args.max_hls_per_month
+    GEDI_L4A_COLLECTION_ID = args.gedi_collection_id
+
+    # HLS QA accept flags (used by hls_v2_clear_mask)
+    global HLS_QA_ACCEPT_WATER, HLS_QA_ACCEPT_ADJACENT, HLS_QA_ACCEPT_SNOW
+    HLS_QA_ACCEPT_WATER = bool(args.accept_water)
+    HLS_QA_ACCEPT_ADJACENT = bool(args.accept_adjacent)
+    HLS_QA_ACCEPT_SNOW = bool(args.accept_snow)
+
+    # Workspace & outputs
+    workdir = os.path.abspath(args.workdir)
+    os.makedirs(workdir, exist_ok=True)
+    gedi_cache = os.path.join(workdir, "gedi_cache")
+    hls_cache  = os.path.join(workdir, "hls_cache_hls_v2")
     os.makedirs(gedi_cache, exist_ok=True)
     os.makedirs(hls_cache,  exist_ok=True)
 
-    max_per_month = 40   # set to None to process ALL granules per month (can be heavy)
+    OUT_CSV = args.out_csv if os.path.isabs(args.out_csv) else os.path.join(workdir, args.out_csv)
+
+    # GEDI per-month cap
+    max_per_month = args.limit_gedi_per_month if args.limit_gedi_per_month is not None else None
+
+    print(f"AOI bbox: {AOI_BBOX}")
+    print(f"Year: {YEAR}  Months: {MONTHS}  Rolling ±{ROLLING_DAYS}d")
+    print(f"Workdir: {workdir}")
+    print(f"GEDI cache: {gedi_cache} | HLS cache: {hls_cache}")
+    print(f"Output CSV: {OUT_CSV}")
 
     # -----------------------------
     # 1) GEDI L4A: download & read
@@ -1002,4 +1097,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_cli()
+    main(args)
