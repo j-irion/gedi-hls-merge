@@ -1,4 +1,4 @@
-# GEDI–HLS Joiner (30 m) — README
+# GEDI–HLS Joiner (30 m)
 
 This script builds a **per-shot, per-month** dataset by aligning **GEDI L4A** above-ground biomass density (AGBD) measurements with **HLS v2.0** optical reflectance from **both** Sentinel-2 (HLSS30) and Landsat-8/9 (HLSL30).
 
