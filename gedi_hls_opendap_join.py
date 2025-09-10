@@ -765,119 +765,139 @@ def main():
     from rasterio.crs import CRS
 
     def search_hlss30(aoi_bbox, start_dt, end_dt, limit=None):
-        """Search Earthdata CMR for HLSS30 v2.0 granules."""
-        try:
-            results = earthaccess.search_data(
-                short_name="HLSS30",
-                version="2.0",
-                bounding_box=(aoi_bbox[0], aoi_bbox[1], aoi_bbox[2], aoi_bbox[3]),
-                temporal=(start_dt, end_dt)
-            )
-        except Exception:
-            results = []
-        if not results:
-            return []
-        # sort by datetime if present
+        """Search Earthdata CMR for BOTH HLSS30 and HLSL30 v2.0 granules."""
+
+        def _q(short_name):
+            try:
+                return earthaccess.search_data(
+                    short_name=short_name,
+                    version="2.0",
+                    bounding_box=(aoi_bbox[0], aoi_bbox[1], aoi_bbox[2], aoi_bbox[3]),
+                    temporal=(start_dt, end_dt),
+                )
+            except Exception:
+                return []
+
+        s30 = _q("HLSS30")
+        l30 = _q("HLSL30")
+        results = list(s30) + list(l30)
+
+        # sort by start time if available
         try:
             results = sorted(
                 results,
-                key=lambda g: pd.to_datetime(getattr(g, "umm", {}).get("TemporalExtent", {})
-                                             .get("RangeDateTime", {}).get("BeginningDateTime", "1970-01-01"))
+                key=lambda g: pd.to_datetime(
+                    getattr(g, "umm", {})
+                    .get("TemporalExtent", {})
+                    .get("RangeDateTime", {})
+                    .get("BeginningDateTime", "1970-01-01")
+                ),
             )
         except Exception:
             pass
+
         if limit:
             results = results[:limit]
         return results
 
     def band_paths_from_downloaded(files):
         """
-        Return dict of needed bands from a list of local paths for one S30 granule.
-        Handles case-insensitive suffixes like .B02.tif, .Fmask.tif.
+        Return canonical band paths for one HLS granule (HLSS30 or HLSL30).
+        Maps:
+          Blue=B02, Green=B03, Red=B04,
+          NIR=B08 (S2) or B05 (L8/9),
+          SWIR1=B11 (S2) or B06 (L8/9),
+          SWIR2=B12 (S2) or B07 (L8/9)
         """
-        paths = {b: None for b in ["B02", "B03", "B04", "B08", "B11", "B12", "Fmask"]}
+        paths = {
+            b: None for b in ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2", "Fmask"]
+        }
         for p in files:
             s = str(p)
             low = s.lower()
             if not low.endswith(".tif"):
                 continue
+
             if re.search(r"\.b02\.tif$", low):
-                paths["B02"] = s
+                paths["Blue"] = s
             elif re.search(r"\.b03\.tif$", low):
-                paths["B03"] = s
+                paths["Green"] = s
             elif re.search(r"\.b04\.tif$", low):
-                paths["B04"] = s
+                paths["Red"] = s
+
+            # NIR
             elif re.search(r"\.b08\.tif$", low):
-                paths["B08"] = s  # NIR
+                paths["NIR"] = s  # Sentinel-2
+            elif re.search(r"\.b05\.tif$", low) and paths["NIR"] is None:  # Landsat
+                paths["NIR"] = s
+
+            # SWIR1
             elif re.search(r"\.b11\.tif$", low):
-                paths["B11"] = s  # SWIR1
+                paths["SWIR1"] = s  # Sentinel-2
+            elif re.search(r"\.b06\.tif$", low) and paths["SWIR1"] is None:  # Landsat
+                paths["SWIR1"] = s
+
+            # SWIR2
             elif re.search(r"\.b12\.tif$", low):
-                paths["B12"] = s  # SWIR2
+                paths["SWIR2"] = s  # Sentinel-2
+            elif re.search(r"\.b07\.tif$", low) and paths["SWIR2"] is None:  # Landsat
+                paths["SWIR2"] = s
+
             elif re.search(r"\.fmask\.tif$", low):
                 paths["Fmask"] = s
         return paths
 
     def sample_hlss30_month(aoi_bbox, start_dt, end_dt, pts_lonlat, max_items):
         """
-        Download HLSS30 v2.0 granules from Earthdata, sample only the GEDI points that
-        fall inside each tile (in tile CRS), mask by Fmask, and return rolling-window medians.
+        Download HLS (HLSS30 + HLSL30) v2.0 granules from Earthdata, sample only the GEDI points
+        that fall inside each tile (in tile CRS), mask by QA/Fmask, and return rolling-window medians.
         """
-        # 1) Search
-        try:
-            results = earthaccess.search_data(
-                short_name="HLSS30",
-                version="2.0",
-                bounding_box=(aoi_bbox[0], aoi_bbox[1], aoi_bbox[2], aoi_bbox[3]),
-                temporal=(start_dt, end_dt),
-            )
-        except Exception:
-            results = []
+        # 1) Search BOTH sensors
+        results = search_hlss30(aoi_bbox, start_dt, end_dt, limit=max_items)
         if not results:
             return None, 0
-        if max_items:
-            results = results[:max_items]
 
-        # 2) Download granule assets to cache
+        # 2) Download assets to cache
         try:
             dl = earthaccess.download(results, local_path=hls_cache)
         except TypeError:
             dl = earthaccess.download(results, hls_cache)
 
-        # 3) Bundle files by granule (strip the trailing band suffix)
+        # 3) Bundle files by granule (strip trailing band suffix for either sensor)
         bundles = {}
         for p in dl:
             s = str(p)
             low = s.lower()
             if not low.endswith(".tif"):
                 continue
-            # remove one of the known suffixes from the end
-            base = re.sub(r"\.(b02|b03|b04|b08|b11|b12|fmask)\.tif$", "", s, flags=re.I)
+            base = re.sub(
+                r"\.(b02|b03|b04|b05|b06|b07|b08|b11|b12|fmask)\.tif$",
+                "",
+                s,
+                flags=re.I,
+            )
             bundles.setdefault(base, []).append(s)
 
         # 4) Prepare containers
         n = len(pts_lonlat)
         lons = np.array([xy[0] for xy in pts_lonlat], dtype=np.float64)
         lats = np.array([xy[1] for xy in pts_lonlat], dtype=np.float64)
-        per_band = {b: [] for b in ["B02", "B03", "B04", "B08", "B11", "B12"]}
+        bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+        per_band = {b: [] for b in bands}
 
         used = 0
-        from rasterio.warp import transform as rio_transform
-        from rasterio.crs import CRS
 
         # 5) Process each granule
-        for base, files in tqdm(bundles.items(), desc="HLSS30 sampling", leave=False):
+        for base, files in tqdm(bundles.items(), desc="HLS sampling", leave=False):
             paths = band_paths_from_downloaded(files)
             if paths["Fmask"] is None:
                 continue  # need Fmask to decide 'clear' pixels
 
             try:
                 with rasterio.open(paths["Fmask"]) as src_m:
-                    # transform WGS84 points into this tile's CRS
                     xs, ys = rio_transform(CRS.from_epsg(4326), src_m.crs, lons, lats)
                     xs = np.asarray(xs)
                     ys = np.asarray(ys)
-
-                    # fast inside-tile test
                     left, bottom, right, top = src_m.bounds
                     in_tile = (
                         (xs >= left) & (xs <= right) & (ys >= bottom) & (ys <= top)
@@ -886,11 +906,11 @@ def main():
                     if idx_tile.size == 0:
                         continue
 
-                    # sample Fmask only on points inside this tile
                     coords_tile = list(zip(xs[idx_tile], ys[idx_tile]))
-                    fmask_vals = np.array([v[0] for v in src_m.sample(coords_tile)], dtype=np.uint16)
+                    fmask_vals = np.array(
+                        [v[0] for v in src_m.sample(coords_tile)], dtype=np.uint16
+                    )
 
-                # keep only 'clear' codes; you currently use {0}. If you want to keep clear water too, use {0,1}.
                 keep_local = hls_v2_clear_mask(
                     fmask_vals,
                     accept_water=HLS_QA_ACCEPT_WATER,
@@ -900,19 +920,11 @@ def main():
                 if not keep_local.any():
                     continue
 
-                # absolute indices (in the full GEDI vector) for clear points in this tile
                 idx_keep = idx_tile[keep_local]
 
-                # for each reflectance band, sample only those clear points, then place into full-length vector
-                for b, asset_key in [
-                    ("B02", "B02"),
-                    ("B03", "B03"),
-                    ("B04", "B04"),
-                    ("B08", "B08"),
-                    ("B11", "B11"),
-                    ("B12", "B12"),
-                ]:
-                    pth = paths[asset_key]
+                # sample canonical bands
+                for b in bands:
+                    pth = paths[b]
                     full = np.full(n, np.nan, dtype=np.float32)
                     if pth is not None and idx_keep.size:
                         with rasterio.open(pth) as src_b:
@@ -931,13 +943,13 @@ def main():
                 used += 1
 
             except Exception as e:
-                warnings.warn(f"HLSS30 sampling failed for {base}: {e}")
+                warnings.warn(f"HLS sampling failed for {base}: {e}")
                 continue
 
         if used == 0:
             return None, 0
 
-        # 6) Median across the stack
+        # 6) Median across the stack (both sensors together)
         med = {}
         for k, stacks in per_band.items():
             if len(stacks) == 0:
@@ -969,14 +981,15 @@ def main():
 
         out = gedi[["footprint_id","lon","lat","agbd","agbd_se","beam","shot_number"]].copy()
         out["ym"]   = f"{YEAR}-{m:02d}"
-        out["Blue"]  = med["B02"]
-        out["Green"] = med["B03"]
-        out["Red"]   = med["B04"]
-        out["NIR"]   = med["B08"]
-        out["SWIR1"] = med["B11"]
-        out["SWIR2"] = med["B12"]
+        out["Blue"] = med["Blue"]
+        out["Green"] = med["Green"]
+        out["Red"] = med["Red"]
+        out["NIR"] = med["NIR"]
+        out["SWIR1"] = med["SWIR1"]
+        out["SWIR2"] = med["SWIR2"]
+        print(f"[ok] {YEAR}-{m:02d}: HLS items used={used}, rows={len(out)}")
+
         all_months.append(out)
-        print(f"[ok] {YEAR}-{m:02d}: HLSS30 items used={used}, rows={len(out)}")
 
     # --------------------------------
     # 3) Save combined CSV
