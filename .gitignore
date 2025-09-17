@@ -209,7 +209,8 @@ __marimo__/
 gedi_cache
 gedi_labels
 hls_composites
-hls_cache_hlss30_v2
+hls_cache_hls_v2
+work
 gedi_hls_monthly_30m.csv
 hls_gedi_manifest.csv
 .idea

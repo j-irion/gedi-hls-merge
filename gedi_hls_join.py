@@ -1,6 +1,5 @@
 import sys, warnings, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from dateutil import parser as dtparser
 from typing import List, Tuple
 import tempfile, os
 import h5py
@@ -14,11 +13,9 @@ import pandas as pd
 from tqdm import tqdm
 
 import rasterio
-from rasterio.errors import RasterioIOError
 from rasterio.warp import transform as rio_transform
 from rasterio.crs import CRS
-from pystac_client import Client
-import planetary_computer as pc
+import imageio.v2 as imageio
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -104,10 +101,196 @@ def parse_cli():
     p.add_argument("--accept-snow", action="store_true",
                    help="Keep snow/ice pixels")
 
+    # Mosaic (optional)
+    p.add_argument("--mosaic", action="store_true",
+                   help="Build an RGB mosaic from downloaded HLS bands (off by default).")
+    p.add_argument("--mosaic-crs", type=str, default="EPSG:4326",
+                   help="Target CRS for mosaic (default: EPSG:4326).")
+    p.add_argument("--mosaic-res-m", type=float, default=120.0,
+                   help="Approx output pixel size in meters (default: 120m; use 30m for full-res, more memory).")
+    p.add_argument("--mosaic-out", type=str, default="hls_mosaic.tif",
+                   help="Output RGB GeoTIFF (relative to --workdir if not absolute).")
+    p.add_argument("--mosaic-png", type=str, default=None,
+                   help="Optional 8-bit PNG quicklook (relative to --workdir if not absolute).")
+
+
     return p.parse_args()
 
 
 # -------------- Helpers --------------
+def build_hls_rgb_mosaic(hls_cache_dir: str,
+                         aoi_bbox: tuple[float,float,float,float],
+                         out_tif: str,
+                         out_png: str | None = None,
+                         dst_crs: str = "EPSG:4326",
+                         res_m: float = 120.0,
+                         accept_water=False,
+                         accept_adjacent=False,
+                         accept_snow=False):
+    """
+    Create an RGB mosaic GeoTIFF (and optional PNG) from all HLS tiles in `hls_cache_dir`.
+    Uses Fmask to keep only clear pixels. Bands:
+      R=B04, G=B03, B=B02 (works for both HLSS30/HLSL30).
+    """
+    import math, os, re
+    import numpy as np
+    import rasterio
+    from rasterio.vrt import WarpedVRT
+    from rasterio.enums import Resampling
+    from rasterio.transform import from_bounds
+
+    xmin, ymin, xmax, ymax = aoi_bbox
+
+    # --- find and bundle all band/Fmask files in cache
+    bundles = {}
+    for root, _, files in os.walk(hls_cache_dir):
+        for fn in files:
+            if not fn.lower().endswith(".tif"):
+                continue
+            full = os.path.join(root, fn)
+            base = re.sub(r"\.(b02|b03|b04|b05|b06|b07|b08|b11|b12|fmask)\.tif$",
+                          "", full, flags=re.I)
+            bundles.setdefault(base, []).append(full)
+
+    if not bundles:
+        print("[mosaic] no HLS .tif files found in cache; skipping.")
+        return
+
+    # map files in a bundle to canonical paths
+    def _paths(files):
+        paths = {"B02":None,"B03":None,"B04":None,"Fmask":None}
+        for s in files:
+            low = s.lower()
+            if   re.search(r"\.b02\.tif$", low): paths["B02"] = s
+            elif re.search(r"\.b03\.tif$", low): paths["B03"] = s
+            elif re.search(r"\.b04\.tif$", low): paths["B04"] = s
+            elif re.search(r"\.fmask\.tif$", low): paths["Fmask"] = s
+        return paths
+
+    # optional: sort bundles by acquisition date embedded in filenames (YYYYMMDD or YYYYDDD)
+    def _bundle_dt(files):
+        s = "_".join(os.path.basename(f) for f in files)
+        m = re.search(r"\.(\d{8})T", s)  # YYYYMMDD
+        if m:
+            y,mn,d = int(m.group(1)[:4]), int(m.group(1)[4:6]), int(m.group(1)[6:8])
+            from datetime import datetime
+            return datetime(y,mn,d)
+        m = re.search(r"\.(\d{7})T", s)  # YYYYDDD
+        if m:
+            y, doy = int(m.group(1)[:4]), int(m.group(1)[4:])
+            from datetime import datetime, timedelta
+            return datetime(y,1,1) + timedelta(doy-1)
+        return None
+
+    sorted_bundles = sorted(bundles.items(), key=lambda kv: (_bundle_dt(kv[1]) or 0), reverse=True)
+
+    # --- output grid
+    # approximate degrees from meters for EPSG:4326
+    if dst_crs.upper() == "EPSG:4326":
+        lat_mid = (ymin + ymax) / 2.0
+        res_y = res_m / 111320.0
+        res_x = res_m / (111320.0 * max(math.cos(math.radians(lat_mid)), 1e-6))
+        width  = max(1, int(math.ceil((xmax - xmin) / res_x)))
+        height = max(1, int(math.ceil((ymax - ymin) / res_y)))
+        transform = from_bounds(xmin, ymin, xmax, ymax, width, height)
+    else:
+        # let rasterio figure out resolution approximately by warping first Fmask, then derive transform
+        # fallback to ~30m pixels if CRS is projected and user didn't specify
+        width = height = None
+        transform = None
+
+    # --- alloc outputs (float32; we’ll export uint16 nodata=65535)
+    if width is None or height is None or transform is None:
+        # derive from first available file by building a VRT at requested res_m
+        first = next(iter(sorted_bundles))[1][0]
+        with rasterio.open(first) as src:
+            with WarpedVRT(src, crs=dst_crs, resampling=Resampling.nearest,
+                           resolution=res_m) as vrt:
+                transform = vrt.transform
+                width, height = vrt.width, vrt.height
+
+    R = np.full((height, width), np.nan, dtype=np.float32)
+    G = np.full((height, width), np.nan, dtype=np.float32)
+    B = np.full((height, width), np.nan, dtype=np.float32)
+
+    # --- compose
+    for base, files in tqdm(sorted_bundles, desc="[mosaic] bundles", leave=False):
+        paths = _paths(files)
+        if not (paths["Fmask"] and paths["B02"] and paths["B03"] and paths["B04"]):
+            continue
+        try:
+            # warp Fmask to target grid
+            with rasterio.open(paths["Fmask"]) as srcm, \
+                 WarpedVRT(srcm, crs=dst_crs, transform=transform, width=width, height=height,
+                           resampling=Resampling.nearest) as vrtm:
+                fmask = vrtm.read(1).astype(np.uint16)
+            keep = hls_v2_clear_mask(fmask,
+                                     accept_water=accept_water,
+                                     accept_adjacent=accept_adjacent,
+                                     accept_snow=accept_snow)
+            if not keep.any():
+                continue
+
+            def _read_band(p, resamp=Resampling.bilinear):
+                with rasterio.open(p) as src, \
+                     WarpedVRT(src, crs=dst_crs, transform=transform, width=width, height=height,
+                               resampling=resamp) as vrt:
+                    return vrt.read(1).astype(np.float32)
+
+            r = _read_band(paths["B04"]); r[~keep] = np.nan
+            g = _read_band(paths["B03"]); g[~keep] = np.nan
+            b = _read_band(paths["B02"]); b[~keep] = np.nan
+
+            # fill where mosaic still empty
+            maskR = np.isnan(R) & np.isfinite(r); R[maskR] = r[maskR]
+            maskG = np.isnan(G) & np.isfinite(g); G[maskG] = g[maskG]
+            maskB = np.isnan(B) & np.isfinite(b); B[maskB] = b[maskB]
+        except Exception as e:
+            warnings.warn(f"[mosaic] failed for {base}: {e}")
+            continue
+
+    # --- write GeoTIFF (uint16, nodata=65535; values clipped to 0..10000 typical HLS scale)
+    os.makedirs(os.path.dirname(out_tif) or ".", exist_ok=True)
+    arrs = []
+    for A in (R, G, B):
+        u = np.full_like(A, 65535, dtype=np.uint16)
+        good = np.isfinite(A)
+        u[good] = np.clip(A[good], 0, 10000).astype(np.uint16)
+        arrs.append(u)
+
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 3,
+        "dtype": "uint16",
+        "crs": dst_crs,
+        "transform": transform,
+        "tiled": True,
+        "compress": "deflate",
+        "predictor": 2,
+        "BIGTIFF": "IF_SAFER",
+        "nodata": 65535,
+    }
+    with rasterio.open(out_tif, "w", **profile) as dst:
+        dst.write(arrs[0], 1); dst.set_band_description(1, "Red (B04)")
+        dst.write(arrs[1], 2); dst.set_band_description(2, "Green (B03)")
+        dst.write(arrs[2], 3); dst.set_band_description(3, "Blue (B02)")
+    print(f"[mosaic] saved GeoTIFF: {out_tif}")
+
+    # --- optional PNG quicklook (8-bit)
+    if out_png:
+        def to8(a):  # scale 0..10000 -> 0..255
+            a = a.astype(np.float32)
+            a[a == 65535] = np.nan
+            a = np.clip(a, 0, 10000) / 10000.0
+            a[np.isnan(a)] = 0
+            return (a * 255.0 + 0.5).astype(np.uint8)
+        png_rgb = np.dstack([to8(arrs[0]), to8(arrs[1]), to8(arrs[2])])
+        imageio.imwrite(out_png, png_rgb)
+        print(f"[mosaic] saved PNG: {out_png}")
+
+
 def looks_like_netcdf(buf: bytes) -> bool:
     # NetCDF-3 starts with b"CDF", NetCDF-4 is HDF5 and starts with b"\x89HDF\r\n\x1a\n"
     return (len(buf) >= 3 and buf[:3] == b"CDF") or (len(buf) >= 8 and buf[:8] == b"\x89HDF\r\n\x1a\n")
@@ -670,19 +853,6 @@ def read_gedi_from_h5(local_path: str, aoi_bbox, want_quality=True) -> pd.DataFr
     return pd.DataFrame(rows)
 
 # ---------------- HLS helpers ----------------
-def stac_search_hls(aoi_bbox, start_dt, end_dt, max_items=MAX_HLS_ITEMS_PER_MONTH):
-    client = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
-    search = client.search(
-        collections=["HLSL30.v2.0","HLSS30.v2.0"],
-        bbox=list(aoi_bbox),
-        datetime=f"{start_dt.strftime('%Y-%m-%d')}/{end_dt.strftime('%Y-%m-%d')}",
-        limit=10000
-    )
-    items = list(search.get_items())
-    if not items: return []
-    items.sort(key=lambda it: it.datetime or dtparser.parse(it.properties.get("datetime")))
-    if len(items) > max_items: items = items[:max_items]
-    return [pc.sign(it) for it in items]
 
 def item_band_map(item):
     coll = (item.collection_id or item.to_dict().get("collection", ""))
@@ -691,39 +861,6 @@ def item_band_map(item):
     else:
         return {"B02":"B02","B03":"B03","B04":"B04","B05":"B05","B06":"B06","B07":"B07","Fmask":"Fmask"}
 
-def sample_items_at_points(items, pts_lonlat, allowed_fmask=FMASK_CLEAR_VALUES):
-    n = len(pts_lonlat)
-    per_band_values = {b: [] for b in ["B02","B03","B04","B05","B06","B07"]}
-    gdal_env = rasterio.Env(
-        GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
-        CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.tiff",
-        VSI_CACHE="TRUE",
-        VSI_CACHE_SIZE="10000000"
-    )
-    with gdal_env:
-        for it in items:
-            bmap = item_band_map(it)
-            fmask_asset = it.assets.get(bmap["Fmask"])
-            if fmask_asset is None: continue
-            try:
-                with rasterio.open(fmask_asset.href) as src_m:
-                    fmask_vals = np.array([v[0] for v in src_m.sample(pts_lonlat)], dtype=np.float32)
-            except RasterioIOError:
-                continue
-            keep = np.isin(fmask_vals, list(allowed_fmask))
-            if not keep.any(): continue
-            for band in ["B02","B03","B04","B05","B06","B07"]:
-                asset = it.assets.get(bmap[band])
-                if asset is None:
-                    per_band_values[band].append(np.full(n, np.nan, dtype=np.float32)); continue
-                try:
-                    with rasterio.open(asset.href) as src_b:
-                        vals = np.array([v[0] for v in src_b.sample(pts_lonlat)], dtype=np.float32)
-                except RasterioIOError:
-                    vals = np.full(n, np.nan, dtype=np.float32)
-                vals[~keep] = np.nan
-                per_band_values[band].append(vals)
-    return per_band_values
 
 def nanmedian_stack(arr_list):
     if not arr_list: return None
@@ -756,6 +893,202 @@ def hls_v2_clear_mask(qa_array: np.ndarray,
         BAD |= (1 << 5)  # water
     # Ignore aerosol level bits (6–7) and reserved bit 0
     return (qa & BAD) == 0
+
+
+def search_hlss30(aoi_bbox, start_dt, end_dt, limit=None):
+    """Search Earthdata CMR for BOTH HLSS30 and HLSL30 v2.0 granules."""
+
+    def _q(short_name):
+        try:
+            return earthaccess.search_data(
+                short_name=short_name,
+                version="2.0",
+                bounding_box=(aoi_bbox[0], aoi_bbox[1], aoi_bbox[2], aoi_bbox[3]),
+                temporal=(start_dt, end_dt),
+            )
+        except Exception:
+            return []
+
+    s30 = _q("HLSS30")
+    l30 = _q("HLSL30")
+    results = list(s30) + list(l30)
+
+    # sort by start time if available
+    try:
+        results = sorted(
+            results,
+            key=lambda g: pd.to_datetime(
+                getattr(g, "umm", {})
+                .get("TemporalExtent", {})
+                .get("RangeDateTime", {})
+                .get("BeginningDateTime", "1970-01-01")
+            ),
+        )
+    except Exception:
+        pass
+
+    if limit:
+        results = results[:limit]
+    return results
+
+def band_paths_from_downloaded(files):
+    """
+    Return canonical band paths for one HLS granule (HLSS30 or HLSL30).
+    Maps:
+      Blue=B02, Green=B03, Red=B04,
+      NIR=B08 (S2) or B05 (L8/9),
+      SWIR1=B11 (S2) or B06 (L8/9),
+      SWIR2=B12 (S2) or B07 (L8/9)
+    """
+    paths = {
+        b: None for b in ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2", "Fmask"]
+    }
+    for p in files:
+        s = str(p)
+        low = s.lower()
+        if not low.endswith(".tif"):
+            continue
+
+        if re.search(r"\.b02\.tif$", low):
+            paths["Blue"] = s
+        elif re.search(r"\.b03\.tif$", low):
+            paths["Green"] = s
+        elif re.search(r"\.b04\.tif$", low):
+            paths["Red"] = s
+
+        # NIR
+        elif re.search(r"\.b08\.tif$", low):
+            paths["NIR"] = s  # Sentinel-2
+        elif re.search(r"\.b05\.tif$", low) and paths["NIR"] is None:  # Landsat
+            paths["NIR"] = s
+
+        # SWIR1
+        elif re.search(r"\.b11\.tif$", low):
+            paths["SWIR1"] = s  # Sentinel-2
+        elif re.search(r"\.b06\.tif$", low) and paths["SWIR1"] is None:  # Landsat
+            paths["SWIR1"] = s
+
+        # SWIR2
+        elif re.search(r"\.b12\.tif$", low):
+            paths["SWIR2"] = s  # Sentinel-2
+        elif re.search(r"\.b07\.tif$", low) and paths["SWIR2"] is None:  # Landsat
+            paths["SWIR2"] = s
+
+        elif re.search(r"\.fmask\.tif$", low):
+            paths["Fmask"] = s
+    return paths
+
+def sample_hlss30_month(aoi_bbox, start_dt, end_dt, pts_lonlat, max_items, hls_cache_dir):
+    """
+    Download HLS (HLSS30 + HLSL30) v2.0 granules from Earthdata, sample only the GEDI points
+    that fall inside each tile (in tile CRS), mask by QA/Fmask, and return rolling-window medians.
+    """
+    # 1) Search BOTH sensors
+    results = search_hlss30(aoi_bbox, start_dt, end_dt, limit=max_items)
+    if not results:
+        return None, 0
+
+    # 2) Download assets to cache
+    try:
+        dl = earthaccess.download(results, local_path=hls_cache_dir)
+    except TypeError:
+        dl = earthaccess.download(results, hls_cache_dir)
+
+    # 3) Bundle files by granule (strip trailing band suffix for either sensor)
+    bundles = {}
+    for p in dl:
+        s = str(p)
+        low = s.lower()
+        if not low.endswith(".tif"):
+            continue
+        base = re.sub(
+            r"\.(b02|b03|b04|b05|b06|b07|b08|b11|b12|fmask)\.tif$",
+            "",
+            s,
+            flags=re.I,
+        )
+        bundles.setdefault(base, []).append(s)
+
+    # 4) Prepare containers
+    n = len(pts_lonlat)
+    lons = np.array([xy[0] for xy in pts_lonlat], dtype=np.float64)
+    lats = np.array([xy[1] for xy in pts_lonlat], dtype=np.float64)
+    bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+    per_band = {b: [] for b in bands}
+
+    used = 0
+
+    # 5) Process each granule
+    for base, files in tqdm(bundles.items(), desc="HLS sampling", leave=False):
+        paths = band_paths_from_downloaded(files)
+        if paths["Fmask"] is None:
+            continue  # need Fmask to decide 'clear' pixels
+
+        try:
+            with rasterio.open(paths["Fmask"]) as src_m:
+                xs, ys = rio_transform(CRS.from_epsg(4326), src_m.crs, lons, lats)
+                xs = np.asarray(xs)
+                ys = np.asarray(ys)
+                left, bottom, right, top = src_m.bounds
+                in_tile = (
+                    (xs >= left) & (xs <= right) & (ys >= bottom) & (ys <= top)
+                )
+                idx_tile = np.where(in_tile)[0]
+                if idx_tile.size == 0:
+                    continue
+
+                coords_tile = list(zip(xs[idx_tile], ys[idx_tile]))
+                fmask_vals = np.array(
+                    [v[0] for v in src_m.sample(coords_tile)], dtype=np.uint16
+                )
+
+            keep_local = hls_v2_clear_mask(
+                fmask_vals,
+                accept_water=HLS_QA_ACCEPT_WATER,
+                accept_adjacent=HLS_QA_ACCEPT_ADJACENT,
+                accept_snow=HLS_QA_ACCEPT_SNOW,
+            )
+            if not keep_local.any():
+                continue
+
+            idx_keep = idx_tile[keep_local]
+
+            # sample canonical bands
+            for b in bands:
+                pth = paths[b]
+                full = np.full(n, np.nan, dtype=np.float32)
+                if pth is not None and idx_keep.size:
+                    with rasterio.open(pth) as src_b:
+                        vals = np.array(
+                            [
+                                v[0]
+                                for v in src_b.sample(
+                                    list(zip(xs[idx_keep], ys[idx_keep]))
+                                )
+                            ],
+                            dtype=np.float32,
+                        )
+                    full[idx_keep] = vals
+                per_band[b].append(full)
+
+            used += 1
+
+        except Exception as e:
+            warnings.warn(f"HLS sampling failed for {base}: {e}")
+            continue
+
+    if used == 0:
+        return None, 0
+
+    # 6) Median across the stack (both sensors together)
+    med = {}
+    for k, stacks in per_band.items():
+        if len(stacks) == 0:
+            med[k] = np.full(n, np.nan, dtype=np.float32)
+        else:
+            med[k] = np.nanmedian(np.vstack(stacks), axis=0)
+
+    return med, used
 
 
 # ---------------- Main ----------------
@@ -852,206 +1185,6 @@ def main(args):
     gedi = pd.concat(gedi_rows, ignore_index=True).drop_duplicates(subset=["footprint_id"])
     print(f"GEDI shots kept: {len(gedi)}")
 
-    # --------------------------------------------
-    # 2) HLSS30 v2.0 (Earthdata): sample + median
-    # --------------------------------------------
-    # Nested helpers so you don't have to edit imports elsewhere.
-
-    def search_hlss30(aoi_bbox, start_dt, end_dt, limit=None):
-        """Search Earthdata CMR for BOTH HLSS30 and HLSL30 v2.0 granules."""
-
-        def _q(short_name):
-            try:
-                return earthaccess.search_data(
-                    short_name=short_name,
-                    version="2.0",
-                    bounding_box=(aoi_bbox[0], aoi_bbox[1], aoi_bbox[2], aoi_bbox[3]),
-                    temporal=(start_dt, end_dt),
-                )
-            except Exception:
-                return []
-
-        s30 = _q("HLSS30")
-        l30 = _q("HLSL30")
-        results = list(s30) + list(l30)
-
-        # sort by start time if available
-        try:
-            results = sorted(
-                results,
-                key=lambda g: pd.to_datetime(
-                    getattr(g, "umm", {})
-                    .get("TemporalExtent", {})
-                    .get("RangeDateTime", {})
-                    .get("BeginningDateTime", "1970-01-01")
-                ),
-            )
-        except Exception:
-            pass
-
-        if limit:
-            results = results[:limit]
-        return results
-
-    def band_paths_from_downloaded(files):
-        """
-        Return canonical band paths for one HLS granule (HLSS30 or HLSL30).
-        Maps:
-          Blue=B02, Green=B03, Red=B04,
-          NIR=B08 (S2) or B05 (L8/9),
-          SWIR1=B11 (S2) or B06 (L8/9),
-          SWIR2=B12 (S2) or B07 (L8/9)
-        """
-        paths = {
-            b: None for b in ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2", "Fmask"]
-        }
-        for p in files:
-            s = str(p)
-            low = s.lower()
-            if not low.endswith(".tif"):
-                continue
-
-            if re.search(r"\.b02\.tif$", low):
-                paths["Blue"] = s
-            elif re.search(r"\.b03\.tif$", low):
-                paths["Green"] = s
-            elif re.search(r"\.b04\.tif$", low):
-                paths["Red"] = s
-
-            # NIR
-            elif re.search(r"\.b08\.tif$", low):
-                paths["NIR"] = s  # Sentinel-2
-            elif re.search(r"\.b05\.tif$", low) and paths["NIR"] is None:  # Landsat
-                paths["NIR"] = s
-
-            # SWIR1
-            elif re.search(r"\.b11\.tif$", low):
-                paths["SWIR1"] = s  # Sentinel-2
-            elif re.search(r"\.b06\.tif$", low) and paths["SWIR1"] is None:  # Landsat
-                paths["SWIR1"] = s
-
-            # SWIR2
-            elif re.search(r"\.b12\.tif$", low):
-                paths["SWIR2"] = s  # Sentinel-2
-            elif re.search(r"\.b07\.tif$", low) and paths["SWIR2"] is None:  # Landsat
-                paths["SWIR2"] = s
-
-            elif re.search(r"\.fmask\.tif$", low):
-                paths["Fmask"] = s
-        return paths
-
-    def sample_hlss30_month(aoi_bbox, start_dt, end_dt, pts_lonlat, max_items):
-        """
-        Download HLS (HLSS30 + HLSL30) v2.0 granules from Earthdata, sample only the GEDI points
-        that fall inside each tile (in tile CRS), mask by QA/Fmask, and return rolling-window medians.
-        """
-        # 1) Search BOTH sensors
-        results = search_hlss30(aoi_bbox, start_dt, end_dt, limit=max_items)
-        if not results:
-            return None, 0
-
-        # 2) Download assets to cache
-        try:
-            dl = earthaccess.download(results, local_path=hls_cache)
-        except TypeError:
-            dl = earthaccess.download(results, hls_cache)
-
-        # 3) Bundle files by granule (strip trailing band suffix for either sensor)
-        bundles = {}
-        for p in dl:
-            s = str(p)
-            low = s.lower()
-            if not low.endswith(".tif"):
-                continue
-            base = re.sub(
-                r"\.(b02|b03|b04|b05|b06|b07|b08|b11|b12|fmask)\.tif$",
-                "",
-                s,
-                flags=re.I,
-            )
-            bundles.setdefault(base, []).append(s)
-
-        # 4) Prepare containers
-        n = len(pts_lonlat)
-        lons = np.array([xy[0] for xy in pts_lonlat], dtype=np.float64)
-        lats = np.array([xy[1] for xy in pts_lonlat], dtype=np.float64)
-        bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
-        per_band = {b: [] for b in bands}
-
-        used = 0
-
-        # 5) Process each granule
-        for base, files in tqdm(bundles.items(), desc="HLS sampling", leave=False):
-            paths = band_paths_from_downloaded(files)
-            if paths["Fmask"] is None:
-                continue  # need Fmask to decide 'clear' pixels
-
-            try:
-                with rasterio.open(paths["Fmask"]) as src_m:
-                    xs, ys = rio_transform(CRS.from_epsg(4326), src_m.crs, lons, lats)
-                    xs = np.asarray(xs)
-                    ys = np.asarray(ys)
-                    left, bottom, right, top = src_m.bounds
-                    in_tile = (
-                        (xs >= left) & (xs <= right) & (ys >= bottom) & (ys <= top)
-                    )
-                    idx_tile = np.where(in_tile)[0]
-                    if idx_tile.size == 0:
-                        continue
-
-                    coords_tile = list(zip(xs[idx_tile], ys[idx_tile]))
-                    fmask_vals = np.array(
-                        [v[0] for v in src_m.sample(coords_tile)], dtype=np.uint16
-                    )
-
-                keep_local = hls_v2_clear_mask(
-                    fmask_vals,
-                    accept_water=HLS_QA_ACCEPT_WATER,
-                    accept_adjacent=HLS_QA_ACCEPT_ADJACENT,
-                    accept_snow=HLS_QA_ACCEPT_SNOW,
-                )
-                if not keep_local.any():
-                    continue
-
-                idx_keep = idx_tile[keep_local]
-
-                # sample canonical bands
-                for b in bands:
-                    pth = paths[b]
-                    full = np.full(n, np.nan, dtype=np.float32)
-                    if pth is not None and idx_keep.size:
-                        with rasterio.open(pth) as src_b:
-                            vals = np.array(
-                                [
-                                    v[0]
-                                    for v in src_b.sample(
-                                        list(zip(xs[idx_keep], ys[idx_keep]))
-                                    )
-                                ],
-                                dtype=np.float32,
-                            )
-                        full[idx_keep] = vals
-                    per_band[b].append(full)
-
-                used += 1
-
-            except Exception as e:
-                warnings.warn(f"HLS sampling failed for {base}: {e}")
-                continue
-
-        if used == 0:
-            return None, 0
-
-        # 6) Median across the stack (both sensors together)
-        med = {}
-        for k, stacks in per_band.items():
-            if len(stacks) == 0:
-                med[k] = np.full(n, np.nan, dtype=np.float32)
-            else:
-                med[k] = np.nanmedian(np.vstack(stacks), axis=0)
-
-        return med, used
-
     # Prepare GEDI points once
     pts = list(zip(gedi["lon"].to_numpy(), gedi["lat"].to_numpy()))
     all_months = []
@@ -1062,7 +1195,7 @@ def main(args):
         q_start = m_start - timedelta(days=ROLLING_DAYS)
         q_end   = m_end + timedelta(days=ROLLING_DAYS)
 
-        med, used = sample_hlss30_month(AOI_BBOX, q_start, q_end, pts, MAX_HLS_ITEMS_PER_MONTH)
+        med, used = sample_hlss30_month(AOI_BBOX, q_start, q_end, pts, MAX_HLS_ITEMS_PER_MONTH, hls_cache)
         if med is None:
             print(f"[warn] No HLSS30 items for {YEAR}-{m:02d}")
             out = gedi[["footprint_id","lon","lat","agbd","agbd_se","beam","shot_number"]].copy()
@@ -1091,6 +1224,32 @@ def main(args):
     final.to_csv(OUT_CSV, index=False)
     print(f"Saved: {OUT_CSV}")
     print(final.head())
+
+    if args.mosaic:
+        mosaic_tif = (
+            args.mosaic_out
+            if os.path.isabs(args.mosaic_out)
+            else os.path.join(workdir, args.mosaic_out)
+        )
+        mosaic_png = None
+        if args.mosaic_png:
+            mosaic_png = (
+                args.mosaic_png
+                if os.path.isabs(args.mosaic_png)
+                else os.path.join(workdir, args.mosaic_png)
+            )
+
+        build_hls_rgb_mosaic(
+            hls_cache_dir=hls_cache,
+            aoi_bbox=AOI_BBOX,
+            out_tif=mosaic_tif,
+            out_png=mosaic_png,
+            dst_crs=args.mosaic_crs,
+            res_m=float(args.mosaic_res_m),
+            accept_water=HLS_QA_ACCEPT_WATER,
+            accept_adjacent=HLS_QA_ACCEPT_ADJACENT,
+            accept_snow=HLS_QA_ACCEPT_SNOW,
+        )
 
 
 

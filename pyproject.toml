@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "earthaccess>=0.14.0",
     "h5py>=3.14.0",
+    "imageio>=2.37.0",
     "netcdf4>=1.7.2",
     "numpy>=2.3.2",
     "pandas>=2.3.2",
