@@ -61,6 +61,69 @@ python gedi_hls_join.py --aoi-wkt "POLYGON((-150 64,-150 65,-148 65,-148 64,-150
 
 ---
 
+## RGB Mosaic Output (optional)
+
+The script can optionally build a **single RGB GeoTIFF mosaic** of all HLS tiles that were downloaded to the cache during the run.
+
+### What it produces
+
+- A **3-band GeoTIFF** (uint16) with **ColorInterp = Red/Green/Blue**, plus optional **8-bit PNG** quicklook.
+
+- Bands are mapped consistently for both sensors:
+  - **R = B04, G = B03, B = B02.**
+
+- Values are clipped to **0..10000** (typical HLS reflectance scale), with **65535** as nodata.
+
+- Cloud/shadow/snow/water masking uses the same **HLS Fmask** logic and your CLI flags (`--accept-water`, `--accept-adjacent`, `--accept-snow`).
+
+### How tiles are merged
+
+- All cached HLS tiles (both **HLSS30** and **HLSL30**) inside your AOI are considered.
+
+- The mosaic is filled using a first-valid fill: per pixel, the first clear value wins.
+Newest scenes are processed first, so more recent acquisitions take precedence.
+
+### Resolution, CRS & extent
+
+- Target grid is your AOI extent in the chosen CRS.
+
+- `--mosaic-crs` (default `EPSG:4326`) sets the output CRS.
+
+- `--mosaic-res-m` sets the **approximate** pixel size in meters (e.g., `30` for full-res, `120` for a light preview).
+For `EPSG:4326`, meter → degree conversion is handled internally.
+
+### Viewer tips
+
+- Many GIS apps (QGIS, ArcGIS, GDAL tools) will display the RGB GeoTIFF correctly.
+
+- If a generic image viewer shows it in grayscale, that’s a viewer limitation with multi-band GeoTIFFs.
+Use the **PNG quicklook** (8-bit, auto-stretched) for quick previews, or open the TIFF in a GIS and set band rendering to **RGB (1/2/3)** with min/max scaling.
+
+- Remember the values are **reflectance** (scaled integers). For “photo-like” contrast in a GIS, apply min/max or percentile stretches.
+
+### Example
+
+```bash
+python gedi_hls_join.py \
+  --aoi-bbox -97.5,46.5,-90.0,49.5 \
+  --year 2022 --months 7 \
+  --workdir ./work \
+  --out-csv gedi_hls_monthly_30m.csv \
+  --mosaic \
+  --mosaic-out hls_mosaic.tif \
+  --mosaic-png hls_mosaic.png \
+  --mosaic-crs EPSG:4326 \
+  --mosaic-res-m 120
+```
+
+The outputs will be written under `--workdir`:
+
+- `hls_mosaic.tif` — RGB GeoTIFF (uint16, nodata=65535, compressed).
+
+- `hls_mosaic.png` — optional 8-bit preview.
+
+---
+
 ## CLI options
 
 **AOI (choose one; priority is bbox > geojson > wkt):**
@@ -91,6 +154,18 @@ python gedi_hls_join.py --aoi-wkt "POLYGON((-150 64,-150 65,-148 65,-148 64,-150
 - `--accept-water` keep pixels flagged as water (off by default)
 - `--accept-adjacent` keep pixels adjacent to cloud/shadow (off)
 - `--accept-snow` keep snow/ice pixels (off)
+
+**Mosaic (optional)**
+
+- `--mosaic` enable RGB mosaic creation from all cached HLS tiles
+
+- `--mosaic-crs` STR output CRS (default: `EPSG:4326`)
+
+- `--mosaic-res-m` FLOAT approximate pixel size in meters (default: `120.0`; use `30` for full-res)
+
+- `--mosaic-out` PATH output RGB GeoTIFF filename (default: `hls_mosaic.tif`)
+
+- `--mosaic-png` PATH optional 8-bit PNG quicklook
 
 ---
 
