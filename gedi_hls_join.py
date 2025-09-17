@@ -15,6 +15,7 @@ from tqdm import tqdm
 import rasterio
 from rasterio.warp import transform as rio_transform
 from rasterio.crs import CRS
+from rasterio.enums import ColorInterp
 import imageio.v2 as imageio
 
 from requests.adapters import HTTPAdapter
@@ -276,6 +277,7 @@ def build_hls_rgb_mosaic(hls_cache_dir: str,
         dst.write(arrs[0], 1); dst.set_band_description(1, "Red (B04)")
         dst.write(arrs[1], 2); dst.set_band_description(2, "Green (B03)")
         dst.write(arrs[2], 3); dst.set_band_description(3, "Blue (B02)")
+        dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue)
     print(f"[mosaic] saved GeoTIFF: {out_tif}")
 
     # --- optional PNG quicklook (8-bit)
