@@ -1,6 +1,5 @@
-import os, sys, io, json, warnings, xml.etree.ElementTree as ET
+import sys, warnings, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 from dateutil import parser as dtparser
 from typing import List, Tuple
 import tempfile, os
@@ -12,17 +11,18 @@ import earthaccess
 import netCDF4 as nc
 import numpy as np
 import pandas as pd
-from shapely.geometry import box
 from tqdm import tqdm
 
 import rasterio
 from rasterio.errors import RasterioIOError
+from rasterio.warp import transform as rio_transform
+from rasterio.crs import CRS
 from pystac_client import Client
 import planetary_computer as pc
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from dateutil.relativedelta import relativedelta  # you already have this
+from dateutil.relativedelta import relativedelta
 from urllib.parse import urlparse
 
 import argparse
@@ -856,8 +856,6 @@ def main(args):
     # 2) HLSS30 v2.0 (Earthdata): sample + median
     # --------------------------------------------
     # Nested helpers so you don't have to edit imports elsewhere.
-    from rasterio.warp import transform as rio_transform
-    from rasterio.crs import CRS
 
     def search_hlss30(aoi_bbox, start_dt, end_dt, limit=None):
         """Search Earthdata CMR for BOTH HLSS30 and HLSL30 v2.0 granules."""
